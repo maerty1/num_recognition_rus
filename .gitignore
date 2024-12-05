@@ -1,0 +1,5 @@
+/models/*
+/dataset/cars/*
+/dataset/plate/*
+app.log
+appV*
