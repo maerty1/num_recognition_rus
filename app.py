@@ -44,19 +44,18 @@ app = Flask(__name__)
 detection_states = {}
 source_names = []
 
+# Глобальные переменные для хранения метрик
+model_metrics = {
+    'plate': {'total_frames': 0, 'detected_frames': 0, 'accuracy': 0.0},
+    'symbol': {'total_frames': 0, 'detected_frames': 0, 'accuracy': 0.0}
+}
+
 # Настройка логирования
 if LOG_TO_FILE:
     logging.basicConfig(level=logging.INFO, filename=LOG_FILE_PATH, filemode='a',
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# Настройка форматирования времени в UTC
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S %Z%z')
-formatter.converter = time.gmtime  # Использование UTC времени
-
-for handler in logging.root.handlers:
-    handler.setFormatter(formatter)
 
 def create_table_if_not_exists():
     """Создает таблицы record и cameras, если они не существуют."""
@@ -143,6 +142,9 @@ def process_frame(frame, plate_model, symbol_model, clahe, rect_area, source_nam
     plate_img = None  # Инициализация переменной plate_img
     symbols = []  # Инициализация переменной symbols
 
+    plate_detected = False
+    symbol_detected = False
+
     for result in plate_results:
         boxes = result.boxes
         for box in boxes:
@@ -176,13 +178,13 @@ def process_frame(frame, plate_model, symbol_model, clahe, rect_area, source_nam
                 logging.info(f"Распознанный номер с камеры {source_name}: {plate_text} (Уверенность: {confidence:.2f})")
                 coordinates.append((x1, y1, x2, y2))
 
-                # Рисуем прямоугольник вокруг распознанного номера
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # Добавляем текст с номером на изображение
-                cv2.putText(frame, plate_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                plate_detected = True
+                symbol_detected = True
             else:
                 logging.warning(f"Неверный формат номера с камеры {source_name}: {plate_text}")
+
+    update_metrics('plate', plate_detected)
+    update_metrics('symbol', symbol_detected)
 
     return frame, coordinates, plate_text, plate_img, symbols
 
@@ -369,6 +371,7 @@ def capture_frame(url, plate_model, symbol_model, clahe, rect_area, source_name,
                 detection_state['no_detect_count'] = 0
                 detection_state['detect_sec'] += PROCESSING_INTERVAL
                 detection_state['no_detect_sec'] = 0
+                detection_state['plate_text'] = plate_text  # Сохранение распознанного номера
 
                 # Увеличиваем счетчик распознаваний для текущего номера
                 if plate_text in plate_count:
@@ -427,7 +430,11 @@ def generate_frames(url, rect_area, source_name, detection_state):
     while True:
         frame = fetch_image_from_url(url, FETCH_IMAGE_DELAY)  # Задержка в 1 секунду
         if frame is not None:
-            frame, _, _, _, _ = process_frame(frame, plate_model, symbol_model, clahe, rect_area, source_name)
+            frame, coordinates, plate_text, _, _ = process_frame(frame, plate_model, symbol_model, clahe, rect_area, source_name)
+
+            # Рисование рамки на изображении
+            for x1, y1, x2, y2 in coordinates:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
             ret, buffer = cv2.imencode('.jpg', frame)
             frame = buffer.tobytes()
@@ -475,6 +482,13 @@ def index():
             margin: 0;
             border-radius: 10px 10px 0 0;
         }
+        .camera-box p {
+            background-color: #28a745;
+            color: #fff;
+            padding: 5px 0;
+            margin: 0;
+            border-radius: 0 0 10px 10px;
+        }
         .camera-box img {
             width: 100%;
             height: auto;
@@ -515,21 +529,30 @@ def index():
                 statusContainer.empty();
                 data.forEach(function(item) {
                     var statusItem = $(
-                        <div class="status-thumbnail">
+                        `<div class="status-thumbnail">
                             <h6>${item.source}</h6>
                             <p>Детекций: ${item.detect_count}</p>
                             <p>Секунд без детекции: ${item.no_detect_count}</p>
                             <p>Время детекции: ${item.detect_time.toFixed(2)} с</p>
                             <p>Время без детекции: ${item.no_detect_time.toFixed(2)} с</p>
-                        </div>
+                        </div>`
                     );
                     statusContainer.append(statusItem);
                 });
             });
         }
 
+        function updatePlateText() {
+            $.getJSON('/plate_text', function(data) {
+                data.forEach(function(item) {
+                    $(`#plate-text-${item.source_index}`).text(item.plate_text);
+                });
+            });
+        }
+
         $(document).ready(function() {
             setInterval(updateStatus, 1000);
+            setInterval(updatePlateText, 1000);
         });
     </script>
 </head>
@@ -539,6 +562,7 @@ def index():
             {% for source_name in source_names %}
                 <div class="camera-box">
                     <h6 class="text-center">{{ source_name }}</h6>
+                    <p class="text-center" id="plate-text-{{ loop.index0 }}"></p>
                     <img src="{{ url_for('video_feed', source_index=loop.index0) }}" width="640" height="480">
                 </div>
             {% endfor %}
@@ -549,6 +573,19 @@ def index():
 </body>
 </html>
     ''', source_names=source_names)
+    
+@app.route('/plate_text')
+def get_plate_text():
+    """Возвращает распознанные номера для каждой камеры."""
+    plate_texts = []
+    for url, detection_state in detection_states.items():
+        source_name = source_names[list(detection_states.keys()).index(url)]
+        plate_texts.append({
+            'source_index': list(detection_states.keys()).index(url),
+            'source_name': source_name,
+            'plate_text': detection_state.get('plate_text', '')
+        })
+    return jsonify(plate_texts)
 
 @app.route('/video_feed/<int:source_index>')
 def video_feed(source_index):
@@ -654,6 +691,51 @@ def get_cameras():
 
     return jsonify(cameras_list), 200
 
+@app.route('/update_model', methods=['POST'])
+def update_model():
+    """Обновляет модель YOLO."""
+    try:
+        data = request.json
+        model_type = data.get('model_type')
+        model_path = data.get('model_path')
+
+        if model_type not in ['plate', 'symbol']:
+            return jsonify({"error": "Неверный тип модели. Допустимые значения: 'plate', 'symbol'"}), 400
+
+        if not model_path:
+            return jsonify({"error": "Путь к модели обязателен"}), 400
+
+        global plate_model, symbol_model
+
+        if model_type == 'plate':
+            logging.info(f"Загрузка новой модели для плат из {model_path}...")
+            plate_model = YOLO(model_path)
+            logging.info("Новая модель для плат загружена.")
+        elif model_type == 'symbol':
+            logging.info(f"Загрузка новой модели для символов из {model_path}...")
+            symbol_model = YOLO(model_path)
+            logging.info("Новая модель для символов загружена.")
+
+        return jsonify({"message": "Модель успешно обновлена"}), 200
+
+    except Exception as e:
+        logging.error("Ошибка при обновлении модели: %s", str(e))
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+
+def update_metrics(model_type, detected):
+    """Обновляет метрики для модели."""
+    if model_type in model_metrics:
+        model_metrics[model_type]['total_frames'] += 1
+        if detected:
+            model_metrics[model_type]['detected_frames'] += 1
+        model_metrics[model_type]['accuracy'] = (model_metrics[model_type]['detected_frames'] /
+                                                 model_metrics[model_type]['total_frames'])
+
+@app.route('/model_metrics', methods=['GET'])
+def get_model_metrics():
+    """Возвращает метрики моделей."""
+    return jsonify(model_metrics), 200
+
 def main():
     global plate_model, symbol_model, clahe, rect_cam, source_names, detection_states
 
@@ -683,7 +765,7 @@ def main():
             source_names.append(name)
 
         # Словарь для хранения состояния распознавания для каждого источника
-        detection_states = {url: {'detect_count': 0, 'no_detect_count': 0, 'detect_sec': 0, 'no_detect_sec': 0} for url in rect_cam.keys()}
+        detection_states = {url: {'detect_count': 0, 'no_detect_count': 0, 'detect_sec': 0, 'no_detect_sec': 0, 'plate_text': ''} for url in rect_cam.keys()}
 
         threads = []
         for url, rect_area in rect_cam.items():
@@ -707,3 +789,4 @@ def main():
 if __name__ == "__main__":
     threading.Thread(target=main).start()
     app.run(host='0.0.0.0', port=5000)
+

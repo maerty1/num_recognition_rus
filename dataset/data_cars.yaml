@@ -1,0 +1,6 @@
+train: cars
+val: cars
+test: cars
+
+names:
+  0: plate number
