@@ -4,3 +4,4 @@
 app.log
 appV*
 add_cam*.py
+records.db
