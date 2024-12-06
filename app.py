@@ -1,5 +1,6 @@
 import argparse
 from flask import Flask, render_template_string, Response, jsonify, request
+from flask_socketio import SocketIO, emit
 import cv2
 import threading
 import time
@@ -26,6 +27,7 @@ LOG_TO_FILE = True  # Флаг для сохранения логов в фай�
 LOG_FILE_PATH = "app.log"  # Путь к файлу логов
 SUCCESS_RATE_THRESHOLD = 0.6  # Порог успешного распознавания (60%)
 RECENT_ATTEMPTS = 5  # Количество последних попыток для оценки успешного распознавания
+CAMERA_CHECK_INTERVAL = 10  # Интервал проверки изменений в базе данных камер (в секундах)
 
 # Словарь для преобразования индексов классов в символы
 CLASS_TO_SYMBOL = {
@@ -39,10 +41,14 @@ os.makedirs(os.path.join(DATASET_DIR, "cars"), exist_ok=True)
 os.makedirs(os.path.join(DATASET_DIR, "plate"), exist_ok=True)
 
 app = Flask(__name__)
+socketio = SocketIO(app)
 
 # Глобальные переменные для хранения состояния
 detection_states = {}
 source_names = []
+rect_cam = {}
+stop_events = {}
+threads = []
 
 # Глобальные переменные для хранения метрик
 model_metrics = {
@@ -453,6 +459,7 @@ def index():
     <title>Видео с камер</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
     <style>
         body {
             background-color: #f8f9fa;
@@ -523,8 +530,10 @@ def index():
         }
     </style>
     <script>
-        function updateStatus() {
-            $.getJSON('/status', function(data) {
+        $(document).ready(function() {
+            var socket = io.connect('http://' + document.domain + ':' + location.port);
+
+            socket.on('status_update', function(data) {
                 var statusContainer = $('#status-container');
                 statusContainer.empty();
                 data.forEach(function(item) {
@@ -540,19 +549,12 @@ def index():
                     statusContainer.append(statusItem);
                 });
             });
-        }
 
-        function updatePlateText() {
-            $.getJSON('/plate_text', function(data) {
+            socket.on('plate_text_update', function(data) {
                 data.forEach(function(item) {
                     $(`#plate-text-${item.source_index}`).text(item.plate_text);
                 });
             });
-        }
-
-        $(document).ready(function() {
-            setInterval(updateStatus, 1000);
-            setInterval(updatePlateText, 1000);
         });
     </script>
 </head>
@@ -573,7 +575,7 @@ def index():
 </body>
 </html>
     ''', source_names=source_names)
-    
+
 @app.route('/plate_text')
 def get_plate_text():
     """Возвращает распознанные номера для каждой камеры."""
@@ -736,8 +738,74 @@ def get_model_metrics():
     """Возвращает метрики моделей."""
     return jsonify(model_metrics), 200
 
+def check_and_update_cameras():
+    """Проверяет изменения в базе данных камер и обновляет список камер и их состояния."""
+    global rect_cam, source_names, detection_states, stop_events, threads
+
+    while True:
+        # Извлечение данных камер из базы данных
+        cameras = fetch_cameras_from_db()
+        new_rect_cam = {}
+        new_source_names = []
+
+        for camera in cameras:
+            url, x0, y0, x1, y1, name = camera
+            new_rect_cam[url] = (x0, y0, x1, y1)
+            new_source_names.append(name)
+
+        # Обновление списка камер и их состояний
+        for url in list(rect_cam.keys()):
+            if url not in new_rect_cam:
+                # Удаление камеры
+                stop_events[url].set()
+                del rect_cam[url]
+                del detection_states[url]
+                del stop_events[url]
+
+        for url in new_rect_cam:
+            if url not in rect_cam:
+                # Добавление новой камеры
+                rect_cam[url] = new_rect_cam[url]
+                detection_states[url] = {'detect_count': 0, 'no_detect_count': 0, 'detect_sec': 0, 'no_detect_sec': 0, 'plate_text': ''}
+                stop_events[url] = threading.Event()
+                thread = threading.Thread(target=capture_frame, args=(url, plate_model, symbol_model, clahe, rect_cam[url], new_source_names[list(new_rect_cam.keys()).index(url)], detection_states[url], stop_events[url]))
+                threads.append(thread)
+                thread.start()
+
+        source_names = new_source_names
+        rect_cam = new_rect_cam
+
+        time.sleep(CAMERA_CHECK_INTERVAL)
+
+def emit_status_updates():
+    """Отправляет обновления статуса через WebSocket."""
+    while True:
+        status = []
+        for url, detection_state in detection_states.items():
+            source_name = source_names[list(detection_states.keys()).index(url)]
+            status.append({
+                'source': source_name,
+                'detect_count': detection_state['detect_count'],
+                'no_detect_count': detection_state['no_detect_count'],
+                'detect_time': detection_state['detect_sec'],
+                'no_detect_time': detection_state['no_detect_sec']
+            })
+        socketio.emit('status_update', status)
+
+        plate_texts = []
+        for url, detection_state in detection_states.items():
+            source_name = source_names[list(detection_states.keys()).index(url)]
+            plate_texts.append({
+                'source_index': list(detection_states.keys()).index(url),
+                'source_name': source_name,
+                'plate_text': detection_state.get('plate_text', '')
+            })
+        socketio.emit('plate_text_update', plate_texts)
+
+        time.sleep(1)
+
 def main():
-    global plate_model, symbol_model, clahe, rect_cam, source_names, detection_states
+    global plate_model, symbol_model, clahe
 
     logging.info("Загрузка модели YOLO для плат...")
     plate_model = YOLO("models/plate.pt")
@@ -752,41 +820,12 @@ def main():
     create_table_if_not_exists()  # Создание таблицы, если она не существует
     migrate_table()  # Обновление таблицы, добавляя новые столбцы, если они отсутствуют
 
-    stop_events = {}
+    # Запуск потока для проверки изменений в базе данных камер
+    threading.Thread(target=check_and_update_cameras, daemon=True).start()
 
-    while True:
-        # Извлечение данных камер из базы данных
-        cameras = fetch_cameras_from_db()
-        rect_cam = {}
-        source_names = []
-        for camera in cameras:
-            url, x0, y0, x1, y1, name = camera
-            rect_cam[url] = (x0, y0, x1, y1)
-            source_names.append(name)
-
-        # Словарь для хранения состояния распознавания для каждого источника
-        detection_states = {url: {'detect_count': 0, 'no_detect_count': 0, 'detect_sec': 0, 'no_detect_sec': 0, 'plate_text': ''} for url in rect_cam.keys()}
-
-        threads = []
-        for url, rect_area in rect_cam.items():
-            source_name_index = list(rect_cam.keys()).index(url)
-            detection_state = detection_states[url]
-            source_names[source_name_index] = str(source_names[source_name_index])
-
-            # Создание или получение события остановки для камеры
-            stop_event = stop_events.get(url, threading.Event())
-            stop_events[url] = stop_event
-
-            thread = threading.Thread(target=capture_frame, args=(url, plate_model, symbol_model, clahe, rect_area, source_names[source_name_index], detection_state, stop_event))
-            threads.append(thread)
-            thread.start()
-
-        for thread in threads:
-            thread.join()
-
-        time.sleep(PROCESSING_INTERVAL)
+    # Запуск потока для отправки обновлений статуса через WebSocket
+    threading.Thread(target=emit_status_updates, daemon=True).start()
 
 if __name__ == "__main__":
     threading.Thread(target=main).start()
-    app.run(host='0.0.0.0', port=5000)
-
+    socketio.run(app, host='0.0.0.0', port=5000)

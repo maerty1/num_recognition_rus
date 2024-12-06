@@ -3,3 +3,4 @@
 /dataset/plate/*
 app.log
 appV*
+add_cam*.py

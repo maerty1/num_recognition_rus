@@ -1,6 +1,6 @@
 import requests
 
-camera_name = "Въезд весы (192.168.178.148)"
+camera_name = "Выезд весы (192.168.172.55)"
 url = f"http://127.0.0.1:5000/delete_camera/{camera_name}"
 response = requests.delete(url)
 
